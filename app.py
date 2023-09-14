@@ -1,13 +1,42 @@
 import spotipy
-from dotenv import dotenv_values
+from dotenv import load_dotenv
+import datetime
 import openai
+import logging
 import json
+import os
+import argparse
 
-config = dotenv_values(".env")
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-openai.api_key = config["OPEN_AI_API_KEY"]
 
-def get_playlist(prompt, count = 8):
+def main():
+    parser = argparse.ArgumentParser(description="simple cli song utility")
+    parser.add_argument(
+        "-p", type=str, help="The prompt to describe playlist wanted")
+    parser.add_argument("-n", type=int, default=8,
+                        help="The number of songs wanted")
+    parser.add_argument("-envfile", type=str, default=".env",
+                        required=False, help="A dotenv file with your env var")
+
+    args = parser.parse_args()
+    load_dotenv(args.envfile)
+    if any([x not in os.environ for x in ("OPEN_AI_API_KEY", "CLIENT_ID", "CLIENT_SECRET")]):
+        raise ValueError(
+            "Error: msising environment variables. Please check your env file.")
+    if args.n not in range(1, 50):
+        raise ValueError("Error: n should be between 0 and 50")
+
+    openai.api_key = os.environ["OPEN_AI_API_KEY"]
+
+    playlist_prompt = args.p
+    count = args.n
+    playlist = get_playlist(playlist_prompt, count)
+    add_songs_to_spotify(playlist_prompt, playlist)
+
+
+def get_playlist(prompt, count=8):
     example_json = """
     [
         {"song": "Someone Like You", "artist": "Adele"},
@@ -35,42 +64,70 @@ def get_playlist(prompt, count = 8):
     response = openai.ChatCompletion.create(
         messages=messages,
         model="gpt-3.5-turbo",
-        max_tokens = 400
+        max_tokens=400
     )
 
     playlist = json.loads(response["choices"][0]["message"]["content"])
     return playlist
 
-playlist = get_playlist("epic songs", 4)
 
+def add_songs_to_spotify(playlist_prompt, playlist):
 
-spot = spotipy.Spotify(
-    auth_manager=spotipy.SpotifyOAuth(
-        client_id=config["CLIENT_ID"],
-        client_secret=config["CLIENT_SECRET"],
-        redirect_uri="http://localhost:9999",
-        scope="playlist-modify-private"
+    # Use your Spotify API's keypair's Client ID
+    spotipy_client_id = os.environ["CLIENT_ID"]
+    # Use your Spotify API's keypair's Client Secret
+    spotipy_client_secret = os.environ["CLIENT_SECRET"]
+
+    spotipy_redirect_url = "http://localhost:9999"
+
+    spot = spotipy.Spotify(
+        auth_manager=spotipy.SpotifyOAuth(
+            client_id=spotipy_client_id,
+            client_secret=spotipy_client_secret,
+            redirect_uri=spotipy_redirect_url,
+            scope="playlist-modify-private"
+        )
     )
-)
 
-current_user = spot.current_user()
+    current_user = spot.current_user()
 
-track_ids = []
+    assert current_user is not None
 
-assert current_user is not None
+    track_ids = []
 
-for item in playlist:
-    artist, song = item["artist"], item["song"]
-    query = f"{song} {artist}"
+    for item in playlist:
+        artist, song = item["artist"], item["song"]
 
-    search_results = spot.search(q=query, type="track", limit=3)
+        advanced_query = f"artist:({artist}) track:({song})"
+        basic_query = f"{song} {artist}"
 
-    track_ids.append(search_results["tracks"]["items"][0]["id"])
+        for query in [advanced_query, basic_query]:
+            log.debug(f"Searching for query: {query}")
+            search_results = spot.search(
+                q=query, limit=10, type="track")  # , market=market)
 
-created_playlist = spot.user_playlist_create(
-    current_user["id"],
-    public=False,
-    name="TEST_GPT_PLAYLIST1"
-)
+            if not search_results["tracks"]["items"] or search_results["tracks"]["items"][0]["popularity"] < 20:
+                continue
+            else:
+                good_guess = search_results["tracks"]["items"][0]
+                print(f"Found: {good_guess['name']} [{good_guess['id']}]")
+                # print(f"FOUND USING QUERY: {query}")
+                track_ids.append(good_guess["id"])
+                break
 
-spot.user_playlist_add_tracks(current_user["id"], created_playlist["id"], track_ids)
+        else:
+            print(
+                f"Queries {advanced_query} and {basic_query} returned no good results. Skipping.")
+
+    created_playlist = spot.user_playlist_create(
+        current_user["id"],
+        public=False,
+        name=f"{playlist_prompt} ({datetime.datetime.now().strftime('%c')})",
+    )
+
+
+    spot.user_playlist_add_tracks(
+        current_user["id"], created_playlist["id"], track_ids)
+
+if __name__ == "__main__":
+    main()
